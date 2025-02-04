@@ -1,0 +1,268 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Citibike Data Pipeline - Ingestion, Processing, Redshift Loading, and Orchestration
+
+Parameters:
+  RedshiftNamespace:
+    Type: String
+    Default: citibike-namespace
+  RedshiftWorkgroup:
+    Type: String
+    Default: citibike-workgroup
+  GlueScriptS3Path:
+    Type: String
+    Default: s3://citibike-df/scripts/citibike_processing.py
+  ScheduleExpression:
+    Type: String
+    Default: cron(0 12 1 * ? *)  # Run at 12:00 PM UTC on the 1st day of every month
+
+Resources:
+  # S3 Buckets
+  RawDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: citibike-raw-data
+      AccessControl: Private
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ArchiveOldData
+            Status: Enabled
+            ExpirationInDays: 365
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+
+  ProcessedDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: citibike-processed-data
+      AccessControl: Private
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  # IAM Roles
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CitibikeLambdaExecutionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AWSGlueConsoleFullAccess
+        - arn:aws:iam::aws:policy/AmazonRedshiftFullAccess
+
+  GlueServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CitibikeGlueServiceRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+
+  # Lambda Functions
+  DataIngestionLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: citibike-ingestion-lambda
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import requests
+          import zipfile
+          import io
+          from datetime import datetime
+
+          s3 = boto3.client('s3')
+
+          def lambda_handler(event, context):
+              url = "https://s3.amazonaws.com/tripdata/{year_month}-citibike-tripdata.csv.zip"
+              year_month = datetime.now().strftime("%Y%m")
+              response = requests.get(url.format(year_month=year_month))
+              if response.status_code == 200:
+                  with zipfile.ZipFile(io.BytesIO(response.content)) as zip_file:
+                      for file_name in zip_file.namelist():
+                          if file_name.endswith('.csv'):
+                              with zip_file.open(file_name) as csv_file:
+                                  s3.put_object(
+                                      Bucket="citibike-raw-data",
+                                      Key=f"{year_month}-citibike-tripdata.csv",
+                                      Body=csv_file.read()
+                                  )
+              return {"statusCode": 200}
+
+  DataLoadingLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: citibike-loading-lambda
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          # Paste your loading Lambda code here
+
+  # Glue Job
+  DataProcessingJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: citibike-data-processing-job
+      Role: !GetAtt GlueServiceRole.Arn
+      Command:
+        Name: glueetl
+        ScriptLocation: !Ref GlueScriptS3Path
+      DefaultArguments:
+        "--TempDir": !Sub "s3://${ProcessedDataBucket}/temp/"
+        "--job-language": "python"
+        "--job-bookmark-option": "job-bookmark-enable"
+
+  # Redshift Serverless
+  RedshiftNamespace:
+    Type: AWS::RedshiftServerless::Namespace
+    Properties:
+      NamespaceName: !Ref RedshiftNamespace
+
+  RedshiftWorkgroup:
+    Type: AWS::RedshiftServerless::Workgroup
+    Properties:
+      WorkgroupName: !Ref RedshiftWorkgroup
+      NamespaceName: !Ref RedshiftNamespace
+      PubliclyAccessible: true
+      SecurityGroupIds:
+        - !GetAtt RedshiftSecurityGroup.GroupId
+
+  RedshiftSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow Redshift inbound access
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5439
+          ToPort: 5439
+          CidrIp: 0.0.0.0/0  # Restrict this in production
+
+  # Step Functions
+  PipelineStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: CitibikePipeline
+      DefinitionString: !Sub |
+        {
+          "Comment": "Citibike Data Pipeline",
+          "StartAt": "IngestData",
+          "States": {
+            "IngestData": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${DataIngestionLambda}",
+                "Payload": {}
+              },
+              "Next": "ProcessData"
+            },
+            "ProcessData": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {
+                "JobName": "${DataProcessingJob}"
+              },
+              "Next": "LoadData"
+            },
+            "LoadData": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${DataLoadingLambda}",
+                "Payload": {}
+              },
+              "End": true
+            }
+          }
+        }
+      RoleArn: !GetAtt StepFunctionsRole.Arn
+
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CitibikeStepFunctionsRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                  - glue:StartJobRun
+                  - glue:GetJobRun
+                Resource: "*"
+
+  # EventBridge Rule
+  PipelineScheduler:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: citibike-pipeline-schedule
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt PipelineStateMachine.Arn
+          Id: PipelineTrigger
+          RoleArn: !GetAtt EventBridgeRole.Arn
+
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CitibikeEventBridgeRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EventBridgeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !GetAtt PipelineStateMachine.Arn
+
+Outputs:
+  StateMachineArn:
+    Value: !GetAtt PipelineStateMachine.Arn
+  RawDataBucket:
+    Value: !Ref RawDataBucket
+  ProcessedDataBucket:
+    Value: !Ref ProcessedDataBucket
