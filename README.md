@@ -35,18 +35,7 @@ This project automates the **ETL (Extract, Transform, Load)** process for [Citib
 ---
 
 ## Architecture Diagram
-
-```mermaid
-graph TD
-    A[EventBridge Schedule] --> B[Step Functions]
-    B --> C[Lambda: Data Ingestion]
-    C --> D[S3 Raw Bucket]
-    D --> E[Glue ETL Job]
-    E --> F[S3 Processed Bucket]
-    F --> G[Lambda: Data Loading]
-    G --> H[Redshift Serverless]
-    H --> I[QuickSight Analytics]
-```
+![Alt text](architecture-diagram.gif)
 
 ---
 
@@ -121,6 +110,18 @@ graph TD
 4. **PySpark 3.1+** for Glue script.
 
 ---
+## Data Flow
+```mermaid
+graph TD
+    A[EventBridge Schedule] --> B[Step Functions]
+    B --> C[Lambda: Data Ingestion]
+    C --> D[S3 Raw Bucket]
+    D --> E[Glue ETL Job]
+    E --> F[S3 Processed Bucket]
+    F --> G[Lambda: Data Loading]
+    G --> H[Redshift Serverless]
+    H --> I[QuickSight Analytics]
+```
 
 ## Deployment
 
